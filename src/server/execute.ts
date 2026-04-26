@@ -118,12 +118,19 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
   if (systemContent) messages.push({ role: "system", content: systemContent });
   messages.push({ role: "user", content: userContent });
 
-  const url = `${endpoint}${OPENAI_V1_PATH}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
+  // The /openai/v1/ path is Azure's new "v1 API" surface and does NOT take an
+  // api-version query param. Fall back to the legacy /openai/deployments/{name}/
+  // shape only if the user explicitly supplies a non-default apiVersion.
+  const useLegacy = apiVersion !== DEFAULT_API_VERSION && apiVersion !== "";
+  const url = useLegacy
+    ? `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`
+    : `${endpoint}${OPENAI_V1_PATH}/chat/completions`;
 
   const body: Record<string, unknown> = {
     model: deployment,
     messages,
     stream: true,
+    stream_options: { include_usage: true },
   };
   if (cfg.temperature !== undefined) body.temperature = cfg.temperature;
   if (cfg.maxOutputTokens !== undefined) body.max_completion_tokens = cfg.maxOutputTokens;
