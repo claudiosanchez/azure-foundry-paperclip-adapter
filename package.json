@@ -20,7 +20,11 @@
   "exports": {
     ".": "./dist/index.js",
     "./server": "./dist/server/index.js",
-    "./ui": "./dist/ui/index.js"
+    "./ui": "./dist/ui/index.js",
+    "./ui-parser": "./dist/ui-parser.js"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
   },
   "files": [
     "dist",

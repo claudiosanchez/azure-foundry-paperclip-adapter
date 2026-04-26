@@ -12,6 +12,9 @@ import { ADAPTER_TYPE, ADAPTER_LABEL } from "./shared/constants.js";
 export const type = ADAPTER_TYPE;
 export const label = ADAPTER_LABEL;
 
+// Re-export the plugin-loader factory so `await import(packageName)` works.
+export { createServerAdapter } from "./server/index.js";
+
 /**
  * Suggested deployments. Paperclip's UI should still call detectModel() to
  * pull the live deployment list from the user's Foundry resource at config

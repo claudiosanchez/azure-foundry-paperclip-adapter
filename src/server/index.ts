@@ -1,15 +1,46 @@
 /**
  * Server-side adapter module exports.
  */
-export { execute } from "./execute.js";
-export { testEnvironment } from "./test.js";
-export { detectModel } from "./detect-model.js";
-export { listSkills, syncSkills } from "./skills.js";
+import { ADAPTER_TYPE, ADAPTER_LABEL } from "../shared/constants.js";
+import { execute } from "./execute.js";
+import { testEnvironment } from "./test.js";
+import { detectModel } from "./detect-model.js";
+import { listSkills, syncSkills } from "./skills.js";
+import { models, agentConfigurationDoc } from "../index.js";
+
+export { execute, testEnvironment, detectModel, listSkills, syncSkills };
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : null;
+}
+
+/**
+ * Plugin-loader entry point.
+ *
+ * Paperclip's external-adapter plugin loader calls `createServerAdapter()`
+ * from the package root after install. We return a `ServerAdapterModule`
+ * shape (duck-typed against @paperclipai/adapter-utils so the package
+ * still compiles standalone).
+ */
+export function createServerAdapter() {
+  return {
+    type: ADAPTER_TYPE,
+    label: ADAPTER_LABEL,
+    execute,
+    testEnvironment,
+    sessionCodec,
+    listSkills,
+    syncSkills,
+    models,
+    supportsLocalAgentJwt: false,
+    agentConfigurationDoc,
+    detectModel: async () => {
+      const d = detectModel();
+      return { model: d.model, provider: "azure_foundry", source: d.source };
+    },
+  };
 }
 
 /**
