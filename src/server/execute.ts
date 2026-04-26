@@ -120,7 +120,7 @@ export interface ExecuteResult {
 }
 
 const PREFIX = "AF::";
-const DEFAULT_MAX_TOOL_HOPS = 8;
+const DEFAULT_MAX_TOOL_HOPS = 20;
 /** Per-tool-result body soft-cap kept in conversation memory after this hop. */
 const TOOL_RESULT_HISTORY_BUDGET = 1500;
 /** How many of the most-recent tool-result messages stay un-truncated. */
@@ -523,7 +523,16 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
       });
     }
 
-    const ok = finishReason === "stop" || finishReason === "tool_calls";
+    // Soft terminations (clean stop, tool budget hit, output cap hit) → exit 0.
+    // Errors (exception, content_filter, http_error) → exit 1.
+    // Config errors → exit 2 (handled at top of function).
+    const softTerminations = new Set([
+      "stop",
+      "tool_calls",
+      "hop_budget_exhausted",
+      "length",
+    ]);
+    const ok = softTerminations.has(finishReason);
     return {
       exitCode: ok ? 0 : 1,
       finishReason,
