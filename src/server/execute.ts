@@ -15,14 +15,21 @@ import { DEFAULT_TOOLS, dispatchToolCall, type ToolDefinition } from "./tools.js
 import { makeSandboxOptions, type SandboxOptions } from "./sandbox.js";
 
 /**
- * Minimal subset of the adapter execute() context we use. The full shape is
- * defined by @paperclipai/adapter-utils — this duck-types just what we need
- * so the package compiles standalone, and the real type can be tightened
- * once we depend on adapter-utils for real.
+ * Adapter execute() context — accepts both Paperclip's full shape
+ * (AdapterExecutionContext from @paperclipai/adapter-utils, with config +
+ * per-invocation context) and the simpler standalone shape used by our
+ * unit tests (top-level prompt + templateVars).
  */
 export interface ExecuteContext {
-  prompt: string;
+  /** Standalone form — prompt at top level. Overridden by ctx.context.prompt. */
+  prompt?: string;
   config: AzureFoundryConfig & Record<string, unknown>;
+  /** Paperclip per-invocation context — has prompt, taskId, taskTitle, etc. */
+  context?: Record<string, unknown>;
+  /** Paperclip agent metadata. */
+  agent?: { id?: string; name?: string; companyId?: string };
+  /** Paperclip runtime — session, taskKey. */
+  runtime?: { sessionParams?: Record<string, unknown> | null; taskKey?: string | null };
   session?: AzureFoundrySessionParams | null;
   templateVars?: Record<string, string>;
   /** Workspace root for sandbox tools. Defaults to process.cwd(). */
@@ -35,6 +42,73 @@ export interface ExecuteContext {
   ) => Promise<void> | void;
   onSession?: (params: AzureFoundrySessionParams) => Promise<void> | void;
   signal?: AbortSignal;
+}
+
+const DEFAULT_HEARTBEAT_PROMPT = `You are an autonomous agent woken up on a scheduled heartbeat.
+
+You have shell, file, and search tools to inspect the workspace. If there's a
+task assigned to you (look for taskId / taskTitle / taskBody in your context),
+work on it. Otherwise, look for unassigned issues to claim, or report idle.
+
+When done, summarize what you accomplished in plain text.`;
+
+function asStr(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const t = v.trim();
+  return t.length > 0 ? t : undefined;
+}
+
+function buildPrompt(ctx: ExecuteContext): string {
+  // Highest priority: explicit prompt in ctx.context (Paperclip's invocation prompt).
+  const ctxPrompt = asStr(ctx.context?.prompt);
+  if (ctxPrompt) return ctxPrompt;
+
+  // Standalone test path.
+  if (asStr(ctx.prompt)) return ctx.prompt!;
+
+  // Build from task fields if present.
+  const taskId = asStr(ctx.context?.taskId);
+  const taskTitle = asStr(ctx.context?.taskTitle);
+  const taskBody = asStr(ctx.context?.taskBody);
+  if (taskId || taskTitle || taskBody) {
+    return [
+      `You have a task assigned to you.`,
+      taskId ? `Task ID: ${taskId}` : "",
+      taskTitle ? `Title: ${taskTitle}` : "",
+      taskBody ? `\n${taskBody}` : "",
+      `\nWork on the task using your tools, then summarize what you did.`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  // Fallback heartbeat prompt.
+  return DEFAULT_HEARTBEAT_PROMPT;
+}
+
+function buildTemplateVars(ctx: ExecuteContext): Record<string, string> {
+  const out: Record<string, string> = { ...(ctx.templateVars ?? {}) };
+  const cContext = ctx.context ?? {};
+  const stringFields = [
+    "agentId",
+    "agentName",
+    "companyId",
+    "companyName",
+    "runId",
+    "taskId",
+    "taskTitle",
+    "taskBody",
+    "projectName",
+  ];
+  for (const k of stringFields) {
+    const v = asStr(cContext[k]);
+    if (v) out[k] = v;
+  }
+  // Paperclip also exposes agent and runtime separately.
+  if (ctx.agent?.name && !out.agentName) out.agentName = ctx.agent.name;
+  if (ctx.agent?.id && !out.agentId) out.agentId = ctx.agent.id;
+  if (ctx.agent?.companyId && !out.companyId) out.companyId = ctx.agent.companyId;
+  return out;
 }
 
 export interface ExecuteResult {
@@ -66,7 +140,8 @@ function resolveApiKey(cfg: AzureFoundryConfig): string {
   return process.env.AZURE_FOUNDRY_API_KEY?.trim() ?? "";
 }
 
-function expandTemplate(text: string, vars: Record<string, string>): string {
+function expandTemplate(text: string | undefined | null, vars: Record<string, string>): string {
+  if (typeof text !== "string" || text.length === 0) return "";
   return text.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
     const v = vars[key];
     return typeof v === "string" ? v : "";
@@ -249,9 +324,10 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
     ? `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`
     : `${endpoint}${OPENAI_V1_PATH}/chat/completions`;
 
-  const vars = ctx.templateVars ?? {};
+  const vars = buildTemplateVars(ctx);
+  const rawPrompt = buildPrompt(ctx);
   const systemContent = await loadInstructions(cfg, vars);
-  const userContent = expandTemplate(ctx.prompt, vars);
+  const userContent = expandTemplate(rawPrompt, vars);
 
   const messages: ChatMessage[] = [];
   if (systemContent) messages.push({ role: "system", content: systemContent });
