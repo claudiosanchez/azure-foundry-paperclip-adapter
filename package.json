@@ -23,7 +23,9 @@
     "./ui": "./dist/ui/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "src",
+    "tsconfig.json"
   ],
   "scripts": {
     "build": "tsc",
@@ -32,7 +34,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepare": "tsc"
   },
   "dependencies": {
     "@paperclipai/adapter-utils": "^2026.325.0"
