@@ -4,6 +4,7 @@
 export { execute } from "./execute.js";
 export { testEnvironment } from "./test.js";
 export { detectModel } from "./detect-model.js";
+export { listSkills, syncSkills } from "./skills.js";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0

@@ -121,6 +121,13 @@ export interface ExecuteResult {
 
 const PREFIX = "AF::";
 const DEFAULT_MAX_TOOL_HOPS = 8;
+/** Per-tool-result body soft-cap kept in conversation memory after this hop. */
+const TOOL_RESULT_HISTORY_BUDGET = 1500;
+/** How many of the most-recent tool-result messages stay un-truncated. */
+const TOOL_RESULT_RECENT_KEEP = 2;
+/** 429 retry policy. */
+const RATE_LIMIT_RETRIES = 4;
+const RATE_LIMIT_BASE_MS = 1500;
 
 function emit(
   ctx: ExecuteContext,
@@ -176,6 +183,40 @@ interface TurnResult {
   outputTokens: number;
 }
 
+async function postWithRateLimitRetry(
+  url: string,
+  apiKey: string,
+  body: Record<string, unknown>,
+  ctrl: AbortController,
+  onLog: (msg: string) => Promise<void> | void,
+): Promise<Response> {
+  let attempt = 0;
+  for (;;) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "api-key": apiKey,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (res.status !== 429 || attempt >= RATE_LIMIT_RETRIES) return res;
+    const retryAfter = Number(res.headers.get("retry-after"));
+    const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter * 1000
+      : RATE_LIMIT_BASE_MS * Math.pow(2, attempt);
+    await onLog(
+      `Foundry 429 — backing off ${delayMs}ms (attempt ${attempt + 1}/${RATE_LIMIT_RETRIES})`,
+    );
+    // Drain body to free socket.
+    await res.text().catch(() => "");
+    await new Promise<void>((r) => setTimeout(r, delayMs));
+    attempt++;
+  }
+}
+
 async function runStreamingTurn(
   ctx: ExecuteContext,
   url: string,
@@ -183,16 +224,13 @@ async function runStreamingTurn(
   body: Record<string, unknown>,
   ctrl: AbortController,
 ): Promise<TurnResult> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "api-key": apiKey,
-      "content-type": "application/json",
-      accept: "text/event-stream",
-    },
-    body: JSON.stringify(body),
-    signal: ctrl.signal,
-  });
+  const res = await postWithRateLimitRetry(
+    url,
+    apiKey,
+    body,
+    ctrl,
+    (msg) => emitLog(ctx, msg),
+  );
 
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => "");
@@ -395,6 +433,27 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
         });
         finishReason = "hop_budget_exhausted";
         break;
+      }
+
+      // Truncate older tool-result message bodies to keep context bounded.
+      // Keep the N most-recent intact; squash everything older to a one-line summary.
+      const toolResultIdx: number[] = [];
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].role === "tool") toolResultIdx.push(i);
+      }
+      const truncateBefore = toolResultIdx.length - TOOL_RESULT_RECENT_KEEP;
+      for (let k = 0; k < truncateBefore; k++) {
+        const i = toolResultIdx[k];
+        const m = messages[i];
+        const content = typeof m.content === "string" ? m.content : "";
+        if (content.length > TOOL_RESULT_HISTORY_BUDGET) {
+          messages[i] = {
+            ...m,
+            content:
+              content.slice(0, TOOL_RESULT_HISTORY_BUDGET) +
+              `\n…[truncated ${content.length - TOOL_RESULT_HISTORY_BUDGET} chars from older tool result]`,
+          };
+        }
       }
 
       // Execute tool calls and append messages.
