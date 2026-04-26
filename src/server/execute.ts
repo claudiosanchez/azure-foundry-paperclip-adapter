@@ -11,18 +11,24 @@ import type {
   AzureFoundrySessionParams,
   ChatMessage,
 } from "../shared/types.js";
+import { DEFAULT_TOOLS, dispatchToolCall, type ToolDefinition } from "./tools.js";
+import { makeSandboxOptions, type SandboxOptions } from "./sandbox.js";
 
 /**
- * Minimal subset of the adapter execute() context that we use. The full
- * shape is defined by @paperclipai/adapter-utils — this duck-types just
- * what we need so the package compiles standalone, and the real type can
- * be tightened once we depend on adapter-utils for real.
+ * Minimal subset of the adapter execute() context we use. The full shape is
+ * defined by @paperclipai/adapter-utils — this duck-types just what we need
+ * so the package compiles standalone, and the real type can be tightened
+ * once we depend on adapter-utils for real.
  */
 export interface ExecuteContext {
   prompt: string;
   config: AzureFoundryConfig & Record<string, unknown>;
   session?: AzureFoundrySessionParams | null;
   templateVars?: Record<string, string>;
+  /** Workspace root for sandbox tools. Defaults to process.cwd(). */
+  workspaceRoot?: string;
+  /** Override the tool set surfaced to the model. */
+  tools?: ToolDefinition[];
   onLog: (
     stream: "stdout" | "stderr",
     chunk: string,
@@ -36,9 +42,11 @@ export interface ExecuteResult {
   finishReason: string;
   outputText: string;
   usage: { input: number; output: number };
+  toolHops: number;
 }
 
 const PREFIX = "AF::";
+const DEFAULT_MAX_TOOL_HOPS = 8;
 
 function emit(
   ctx: ExecuteContext,
@@ -78,9 +86,130 @@ async function loadInstructions(
   }
 }
 
+/** Tool call accumulator across streamed deltas. */
+interface PartialToolCall {
+  id: string;
+  name: string;
+  argumentsRaw: string;
+}
+
+interface TurnResult {
+  finishReason: string;
+  contentDelta: string;
+  toolCalls: PartialToolCall[];
+  inputTokens: number;
+  outputTokens: number;
+}
+
+async function runStreamingTurn(
+  ctx: ExecuteContext,
+  url: string,
+  apiKey: string,
+  body: Record<string, unknown>,
+  ctrl: AbortController,
+): Promise<TurnResult> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "api-key": apiKey,
+      "content-type": "application/json",
+      accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+    signal: ctrl.signal,
+  });
+
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Foundry HTTP ${res.status}: ${text.slice(0, 500)}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  let contentDelta = "";
+  let finishReason = "unknown";
+  let inputTokens = 0;
+  let outputTokens = 0;
+  const toolCallsByIndex = new Map<number, PartialToolCall>();
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const rawLine = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!rawLine || !rawLine.startsWith("data:")) continue;
+      const data = rawLine.slice("data:".length).trim();
+      if (data === "[DONE]") {
+        if (finishReason === "unknown") finishReason = "stop";
+        continue;
+      }
+
+      let chunk: {
+        choices?: Array<{
+          delta?: {
+            content?: string;
+            tool_calls?: Array<{
+              index: number;
+              id?: string;
+              type?: string;
+              function?: { name?: string; arguments?: string };
+            }>;
+          };
+          finish_reason?: string;
+        }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      };
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      const delta = chunk.choices?.[0]?.delta;
+      if (delta?.content) {
+        contentDelta += delta.content;
+        await emit(ctx, { kind: "token", text: delta.content });
+      }
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const slot = toolCallsByIndex.get(tc.index) ?? {
+            id: "",
+            name: "",
+            argumentsRaw: "",
+          };
+          if (tc.id) slot.id = tc.id;
+          if (tc.function?.name) slot.name = tc.function.name;
+          if (tc.function?.arguments) slot.argumentsRaw += tc.function.arguments;
+          toolCallsByIndex.set(tc.index, slot);
+        }
+      }
+      const fr = chunk.choices?.[0]?.finish_reason;
+      if (fr) finishReason = fr;
+      if (chunk.usage) {
+        inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
+        outputTokens = chunk.usage.completion_tokens ?? outputTokens;
+      }
+    }
+  }
+
+  // Materialize tool calls in index order.
+  const toolCalls = Array.from(toolCallsByIndex.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, v]) => v)
+    .filter((tc) => tc.name.length > 0);
+
+  return { finishReason, contentDelta, toolCalls, inputTokens, outputTokens };
+}
+
 /**
- * MVP execute: one round-trip Foundry chat.completions call with streaming.
- * Tool calls are surfaced as events but not executed yet — that's milestone 2.
+ * Streaming agent loop:
+ *   send messages → stream → if tool_calls: execute, append, repeat → else stop.
  */
 export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
   const cfg = ctx.config;
@@ -91,24 +220,34 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
     .replace(/\/+$/, "");
   if (!endpoint) {
     await emit(ctx, { kind: "error", message: "AZURE_FOUNDRY_ENDPOINT not configured" });
-    return { exitCode: 2, finishReason: "config_error", outputText: "", usage: { input: 0, output: 0 } };
+    return { exitCode: 2, finishReason: "config_error", outputText: "", usage: { input: 0, output: 0 }, toolHops: 0 };
   }
 
   const apiKey = resolveApiKey(cfg);
   if (!apiKey) {
     await emit(ctx, { kind: "error", message: "AZURE_FOUNDRY_API_KEY not configured" });
-    return { exitCode: 2, finishReason: "config_error", outputText: "", usage: { input: 0, output: 0 } };
+    return { exitCode: 2, finishReason: "config_error", outputText: "", usage: { input: 0, output: 0 }, toolHops: 0 };
   }
 
   const deployment = (cfg.deployment ?? DEFAULT_DEPLOYMENT).toString().trim();
   const apiVersion = (cfg.apiVersion ?? DEFAULT_API_VERSION).toString().trim();
   const timeoutMs = (cfg.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
   const _graceMs = (cfg.graceSec ?? DEFAULT_GRACE_SEC) * 1000;
+  const enableToolLoop = cfg.enableToolLoop !== false; // default true now that M2 is here
+  const maxToolHops =
+    typeof cfg.maxToolHops === "number" && cfg.maxToolHops > 0
+      ? cfg.maxToolHops
+      : DEFAULT_MAX_TOOL_HOPS;
 
   await emitLog(
     ctx,
-    `Starting Foundry run: deployment=${deployment} apiVersion=${apiVersion} endpoint=${endpoint}`,
+    `Foundry run: deployment=${deployment} toolLoop=${enableToolLoop} maxHops=${maxToolHops} endpoint=${endpoint}`,
   );
+
+  const useLegacy = apiVersion !== DEFAULT_API_VERSION && apiVersion !== "";
+  const url = useLegacy
+    ? `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`
+    : `${endpoint}${OPENAI_V1_PATH}/chat/completions`;
 
   const vars = ctx.templateVars ?? {};
   const systemContent = await loadInstructions(cfg, vars);
@@ -118,23 +257,10 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
   if (systemContent) messages.push({ role: "system", content: systemContent });
   messages.push({ role: "user", content: userContent });
 
-  // The /openai/v1/ path is Azure's new "v1 API" surface and does NOT take an
-  // api-version query param. Fall back to the legacy /openai/deployments/{name}/
-  // shape only if the user explicitly supplies a non-default apiVersion.
-  const useLegacy = apiVersion !== DEFAULT_API_VERSION && apiVersion !== "";
-  const url = useLegacy
-    ? `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`
-    : `${endpoint}${OPENAI_V1_PATH}/chat/completions`;
-
-  const body: Record<string, unknown> = {
-    model: deployment,
-    messages,
-    stream: true,
-    stream_options: { include_usage: true },
-  };
-  if (cfg.temperature !== undefined) body.temperature = cfg.temperature;
-  if (cfg.maxOutputTokens !== undefined) body.max_completion_tokens = cfg.maxOutputTokens;
-  if (cfg.reasoningEffort) body.reasoning_effort = cfg.reasoningEffort;
+  const sandboxOpts: SandboxOptions = makeSandboxOptions({
+    rootDir: ctx.workspaceRoot ?? process.cwd(),
+  });
+  const tools = ctx.tools ?? DEFAULT_TOOLS;
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -142,104 +268,113 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
     ctx.signal.addEventListener("abort", () => ctrl.abort(), { once: true });
   }
 
-  let outputText = "";
-  let inputTokens = 0;
-  let outputTokens = 0;
+  let finalText = "";
+  let totalInput = 0;
+  let totalOutput = 0;
   let finishReason = "unknown";
+  let toolHops = 0;
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "api-key": apiKey,
-        "content-type": "application/json",
-        accept: "text/event-stream",
-      },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-
-    if (!res.ok || !res.body) {
-      const text = await res.text().catch(() => "");
-      await emit(ctx, {
-        kind: "error",
-        message: `Foundry HTTP ${res.status}: ${text.slice(0, 500)}`,
-      });
-      return {
-        exitCode: 1,
-        finishReason: "http_error",
-        outputText: "",
-        usage: { input: 0, output: 0 },
+    for (let hop = 0; hop <= maxToolHops; hop++) {
+      const body: Record<string, unknown> = {
+        model: deployment,
+        messages,
+        stream: true,
+        stream_options: { include_usage: true },
       };
-    }
+      if (cfg.temperature !== undefined) body.temperature = cfg.temperature;
+      if (cfg.maxOutputTokens !== undefined) body.max_completion_tokens = cfg.maxOutputTokens;
+      if (cfg.reasoningEffort) body.reasoning_effort = cfg.reasoningEffort;
+      if (enableToolLoop) body.tools = tools;
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+      const turn = await runStreamingTurn(ctx, url, apiKey, body, ctrl);
+      totalInput += turn.inputTokens;
+      totalOutput += turn.outputTokens;
+      if (turn.contentDelta) finalText += turn.contentDelta;
+      finishReason = turn.finishReason;
 
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // Split on SSE event boundaries.
-      let idx;
-      while ((idx = buffer.indexOf("\n")) >= 0) {
-        const rawLine = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        if (!rawLine || !rawLine.startsWith("data:")) continue;
-        const data = rawLine.slice("data:".length).trim();
-        if (data === "[DONE]") {
-          finishReason = finishReason === "unknown" ? "stop" : finishReason;
-          continue;
-        }
-
-        let chunk: {
-          choices?: Array<{
-            delta?: {
-              content?: string;
-              tool_calls?: Array<{
-                index: number;
-                id?: string;
-                type?: string;
-                function?: { name?: string; arguments?: string };
-              }>;
-            };
-            finish_reason?: string;
-          }>;
-          usage?: { prompt_tokens?: number; completion_tokens?: number };
-        };
-        try {
-          chunk = JSON.parse(data);
-        } catch {
-          continue;
-        }
-
-        const delta = chunk.choices?.[0]?.delta;
-        if (delta?.content) {
-          outputText += delta.content;
-          await emit(ctx, { kind: "token", text: delta.content });
-        }
-        if (delta?.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            await emit(ctx, {
-              kind: "tool_call",
-              id: tc.id ?? `idx-${tc.index}`,
-              name: tc.function?.name ?? "",
-              arguments: tc.function?.arguments ?? "",
-            });
-          }
-        }
-        const fr = chunk.choices?.[0]?.finish_reason;
-        if (fr) finishReason = fr;
-        if (chunk.usage) {
-          inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
-          outputTokens = chunk.usage.completion_tokens ?? outputTokens;
-        }
+      // No tool calls — we're done.
+      if (turn.toolCalls.length === 0) {
+        break;
       }
+
+      // Tool loop disabled — surface and stop.
+      if (!enableToolLoop) {
+        for (const tc of turn.toolCalls) {
+          await emit(ctx, {
+            kind: "tool_call",
+            id: tc.id,
+            name: tc.name,
+            arguments: tc.argumentsRaw,
+          });
+        }
+        break;
+      }
+
+      // Hop budget exhausted.
+      if (hop === maxToolHops) {
+        await emit(ctx, {
+          kind: "error",
+          message: `tool hop budget exhausted (${maxToolHops})`,
+        });
+        finishReason = "hop_budget_exhausted";
+        break;
+      }
+
+      // Execute tool calls and append messages.
+      const assistantToolMessage: ChatMessage = {
+        role: "assistant",
+        content: turn.contentDelta || null,
+        tool_calls: turn.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: "function" as const,
+          function: { name: tc.name, arguments: tc.argumentsRaw },
+        })),
+      };
+      messages.push(assistantToolMessage);
+
+      for (const tc of turn.toolCalls) {
+        await emit(ctx, {
+          kind: "tool_call",
+          id: tc.id,
+          name: tc.name,
+          arguments: tc.argumentsRaw,
+        });
+
+        let parsedArgs: Record<string, unknown>;
+        try {
+          parsedArgs = tc.argumentsRaw ? JSON.parse(tc.argumentsRaw) : {};
+        } catch (err) {
+          parsedArgs = {};
+          await emit(ctx, {
+            kind: "log",
+            level: "warn",
+            message: `bad JSON in tool args for ${tc.name}: ${(err as Error).message}`,
+          });
+        }
+
+        const dispatched = await dispatchToolCall(tc.name, parsedArgs, sandboxOpts);
+        const resultPayload = dispatched.ok
+          ? dispatched.result
+          : { error: dispatched.errorMessage ?? "unknown error" };
+        const resultJson = JSON.stringify(resultPayload);
+
+        await emit(ctx, {
+          kind: "tool_result",
+          id: tc.id,
+          content: resultJson.length > 2000 ? resultJson.slice(0, 2000) + "…[truncated]" : resultJson,
+        });
+
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: resultJson,
+        });
+      }
+      toolHops++;
     }
 
-    await emit(ctx, { kind: "usage", input: inputTokens, output: outputTokens });
+    await emit(ctx, { kind: "usage", input: totalInput, output: totalOutput });
     await emit(ctx, { kind: "finish", reason: finishReason });
 
     if (ctx.onSession) {
@@ -248,24 +383,27 @@ export async function execute(ctx: ExecuteContext): Promise<ExecuteResult> {
         `af-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
       await ctx.onSession({
         conversationId,
-        totalInputTokens: (ctx.session?.totalInputTokens ?? 0) + inputTokens,
-        totalOutputTokens: (ctx.session?.totalOutputTokens ?? 0) + outputTokens,
+        totalInputTokens: (ctx.session?.totalInputTokens ?? 0) + totalInput,
+        totalOutputTokens: (ctx.session?.totalOutputTokens ?? 0) + totalOutput,
       });
     }
 
+    const ok = finishReason === "stop" || finishReason === "tool_calls";
     return {
-      exitCode: finishReason === "stop" || finishReason === "tool_calls" ? 0 : 1,
+      exitCode: ok ? 0 : 1,
       finishReason,
-      outputText,
-      usage: { input: inputTokens, output: outputTokens },
+      outputText: finalText,
+      usage: { input: totalInput, output: totalOutput },
+      toolHops,
     };
   } catch (err) {
     await emit(ctx, { kind: "error", message: (err as Error).message });
     return {
       exitCode: 1,
       finishReason: "exception",
-      outputText,
-      usage: { input: inputTokens, output: outputTokens },
+      outputText: finalText,
+      usage: { input: totalInput, output: totalOutput },
+      toolHops,
     };
   } finally {
     clearTimeout(timer);

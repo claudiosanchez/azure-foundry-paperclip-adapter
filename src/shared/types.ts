@@ -34,11 +34,17 @@ export interface AzureFoundryConfig {
   graceSec?: number;
 
   /**
-   * MVP toggle: when true, the adapter will execute tool_calls returned by
-   * Foundry against Paperclip's adapter-utils sandbox. When false (default),
-   * tool calls are surfaced as logs and the run terminates after one round-trip.
+   * Toggle: when true (default since M2), the adapter executes tool_calls
+   * returned by Foundry against the standalone sandbox and loops until the
+   * model returns a tool-call-free response. When false, tool calls are
+   * surfaced as events and the run terminates after one round-trip.
    */
   enableToolLoop?: boolean;
+
+  /**
+   * Maximum tool-call rounds before the loop bails out. Defaults to 8.
+   */
+  maxToolHops?: number;
 }
 
 /** Session params persisted between heartbeats. */
