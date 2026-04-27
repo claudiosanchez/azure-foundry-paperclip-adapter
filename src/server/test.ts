@@ -94,8 +94,9 @@ export async function testEnvironment(
     });
   }
 
-  // Live reachability + deployment list (only if endpoint+key look usable).
-  let availableDeployments: string[] = [];
+  // Live reachability — hit /v1/models which validates endpoint + API key.
+  // (This endpoint returns Azure's model catalog, NOT the user's deployments.
+  // Deployment names live behind /openai/deployments/... and don't appear here.)
   if (endpoint && apiKey && /^https?:\/\//i.test(endpoint)) {
     const url = `${endpoint}${OPENAI_V1_PATH}/models`;
     try {
@@ -110,12 +111,11 @@ export async function testEnvironment(
 
       if (res.ok) {
         const body = (await res.json()) as { data?: Array<{ id: string }> };
-        availableDeployments = (body.data ?? []).map((m) => m.id);
+        const catalogSize = (body.data ?? []).length;
         checks.push({
           code: "endpoint_reachable",
           level: "info",
-          message: `Foundry reachable — ${availableDeployments.length} deployment${availableDeployments.length === 1 ? "" : "s"} discovered.`,
-          detail: availableDeployments.slice(0, 8).join(", ") || null,
+          message: `Foundry reachable — ${catalogSize} model${catalogSize === 1 ? "" : "s"} in catalog.`,
         });
       } else if (res.status === 401 || res.status === 403) {
         checks.push({
@@ -129,7 +129,7 @@ export async function testEnvironment(
           code: "endpoint_not_found",
           level: "error",
           message: `Endpoint returned 404 for /openai/v1/models`,
-          hint: "Confirm the endpoint URL points at a Foundry/AI-services resource (not e.g. a generic Azure service).",
+          hint: "Confirm the endpoint URL points at a Foundry/AI-services resource.",
         });
       } else {
         const txt = await res.text().catch(() => "");
@@ -152,30 +152,78 @@ export async function testEnvironment(
     }
   }
 
-  // Deployment validation — does the configured deployment exist on the resource?
-  if (deployment) {
-    if (availableDeployments.length === 0) {
-      checks.push({
-        code: "deployment_unverified",
-        level: "warn",
-        message: `Deployment "${deployment}" set but not verified (couldn't list models).`,
+  // Real deployment validation — fire a 1-token chat completion against the
+  // actual deployment. This is the only way to know if the deployment exists
+  // and accepts requests. Skipped when prerequisites are missing or already
+  // failed above.
+  const hadFatal = checks.some((c) => c.level === "error");
+  if (deployment && endpoint && apiKey && !hadFatal) {
+    const chatUrl = `${endpoint}${OPENAI_V1_PATH}/chat/completions`;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      const res = await fetch(chatUrl, {
+        method: "POST",
+        headers: {
+          "api-key": apiKey,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({
+          model: deployment,
+          messages: [{ role: "user", content: "ping" }],
+          max_completion_tokens: 1,
+          stream: false,
+        }),
+        signal: ctrl.signal,
       });
-    } else if (availableDeployments.includes(deployment)) {
+      clearTimeout(timer);
+
+      if (res.ok) {
+        checks.push({
+          code: "deployment_ok",
+          level: "info",
+          message: `Deployment "${deployment}" responds to chat completions.`,
+        });
+      } else {
+        const txt = await res.text().catch(() => "");
+        const isUnknownModel =
+          txt.includes("DeploymentNotFound") ||
+          txt.includes("does not exist") ||
+          txt.includes("model_not_found") ||
+          res.status === 404;
+        if (isUnknownModel) {
+          checks.push({
+            code: "deployment_not_found",
+            level: "error",
+            message: `Deployment "${deployment}" not found on this Foundry resource.`,
+            detail: txt.slice(0, 200) || null,
+            hint: "Check the spelling against the Azure portal → Deployments page.",
+          });
+        } else if (res.status === 429) {
+          checks.push({
+            code: "deployment_rate_limited",
+            level: "warn",
+            message: `Deployment "${deployment}" is rate-limited (HTTP 429), but it exists.`,
+          });
+        } else {
+          checks.push({
+            code: "deployment_chat_failed",
+            level: "warn",
+            message: `Deployment "${deployment}" returned HTTP ${res.status} on a ping.`,
+            detail: txt.slice(0, 200) || null,
+          });
+        }
+      }
+    } catch (err) {
       checks.push({
-        code: "deployment_ok",
-        level: "info",
-        message: `Deployment "${deployment}" exists on the resource.`,
-      });
-    } else {
-      checks.push({
-        code: "deployment_not_found",
+        code: "deployment_ping_failed",
         level: "warn",
-        message: `Deployment "${deployment}" not found in /openai/v1/models output.`,
-        detail: `Available: ${availableDeployments.slice(0, 12).join(", ")}${availableDeployments.length > 12 ? "…" : ""}`,
-        hint: "The /v1/models list returns a model catalog — your deployment name should still work for chat completions, but double-check the spelling on the Azure portal.",
+        message: `Deployment ping threw an exception.`,
+        detail: (err as Error).message,
       });
     }
-  } else {
+  } else if (!deployment) {
     checks.push({
       code: "deployment_missing",
       level: "warn",
