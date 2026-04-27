@@ -172,7 +172,9 @@ export async function testEnvironment(
         body: JSON.stringify({
           model: deployment,
           messages: [{ role: "user", content: "ping" }],
-          max_completion_tokens: 1,
+          // Need enough room for reasoning models (gpt-5.x) to actually
+          // produce a token. Too low triggers a 400 "max_tokens reached".
+          max_completion_tokens: 64,
           stream: false,
         }),
         signal: ctrl.signal,
@@ -187,12 +189,25 @@ export async function testEnvironment(
         });
       } else {
         const txt = await res.text().catch(() => "");
+        // A 400 with a max_tokens-related message means the deployment IS
+        // reachable and responded — it just couldn't finish in 64 tokens.
+        // That's a passing signal for our purposes.
+        const isMaxTokensHint =
+          res.status === 400 &&
+          (txt.includes("max_tokens") || txt.includes("model output limit"));
         const isUnknownModel =
-          txt.includes("DeploymentNotFound") ||
-          txt.includes("does not exist") ||
-          txt.includes("model_not_found") ||
-          res.status === 404;
-        if (isUnknownModel) {
+          !isMaxTokensHint &&
+          (txt.includes("DeploymentNotFound") ||
+            txt.includes("does not exist") ||
+            txt.includes("model_not_found") ||
+            res.status === 404);
+        if (isMaxTokensHint) {
+          checks.push({
+            code: "deployment_ok",
+            level: "info",
+            message: `Deployment "${deployment}" responds to chat completions (reasoning model — token cap hit on ping, but reachable).`,
+          });
+        } else if (isUnknownModel) {
           checks.push({
             code: "deployment_not_found",
             level: "error",
