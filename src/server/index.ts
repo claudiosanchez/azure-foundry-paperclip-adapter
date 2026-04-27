@@ -142,12 +142,6 @@ export function createServerAdapter() {
     supportsLocalAgentJwt: false,
     supportsInstructionsBundle: true,
     instructionsPathKey: "instructionsFilePath",
-    /**
-     * HTTP-only adapter — no CLI process to spawn, so Paperclip's UI should
-     * hide the "Command" / "Extra args" / "Environment variables" fields
-     * (which exist for local-CLI adapters like codex_local, hermes_local).
-     */
-    requiresCliCommand: false,
     agentConfigurationDoc,
     getConfigSchema,
     detectModel: async () => {
