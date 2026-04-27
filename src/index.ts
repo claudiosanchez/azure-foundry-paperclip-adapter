@@ -16,17 +16,26 @@ export const label = ADAPTER_LABEL;
 export { createServerAdapter } from "./server/index.js";
 
 /**
- * Suggested deployments. Paperclip's UI should still call detectModel() to
- * pull the live deployment list from the user's Foundry resource at config
- * time — this list is just sensible defaults shown when no key is configured.
+ * Suggested deployments — chat-completion-capable Foundry models only.
+ *
+ * IMPORTANT: Some Foundry deployments are served exclusively through Azure's
+ * Responses API (`/openai/v1/responses`) and do NOT support chat completions:
+ *
+ *   gpt-5-4-pro    (capabilities.chat_completion: false — pro reasoning)
+ *   gpt-5-3-codex  (capabilities.chat_completion: false — codex/responses-only)
+ *   gpt-5-pro      (capabilities.chat_completion: false)
+ *
+ * Selecting one of those would silently break agents (HTTP 400 "operation is
+ * unsupported"). Until this adapter grows a Responses-API branch, only
+ * chat-completable deployments are surfaced here.
+ *
+ * Embeddings/audio/image/realtime models live in a separate plugin
+ * (paperclip-plugin-foundry-tools, planned).
  */
 export const models = [
-  { id: "gpt-5-5", label: "gpt-5-5 (chat / general)" },
-  { id: "gpt-5-4-pro", label: "gpt-5-4-pro (high reasoning)" },
-  { id: "gpt-5-4-mini", label: "gpt-5-4-mini (high-volume)" },
-  { id: "gpt-5-4-nano", label: "gpt-5-4-nano (triage)" },
-  { id: "gpt-5-3-codex", label: "gpt-5-3-codex (coding)" },
-  { id: "text-embedding-3-large", label: "text-embedding-3-large (embeddings)" },
+  { id: "gpt-5-5", label: "gpt-5-5 (chat — flagship)" },
+  { id: "gpt-5-4-mini", label: "gpt-5-4-mini (chat — high-volume)" },
+  { id: "gpt-5-4-nano", label: "gpt-5-4-nano (chat — triage)" },
 ];
 
 /**
