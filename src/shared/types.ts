@@ -42,9 +42,16 @@ export interface AzureFoundryConfig {
   enableToolLoop?: boolean;
 
   /**
-   * Maximum tool-call rounds before the loop bails out. Defaults to 8.
+   * Maximum tool-call rounds before the loop bails out. Defaults to 20.
    */
   maxToolHops?: number;
+
+  /**
+   * Explicit override for which Foundry API surface this deployment uses.
+   * Normally resolved from `KNOWN_API_SURFACE` in shared/capability.ts;
+   * set this when adding a new deployment that's not yet in the table.
+   */
+  apiSurface?: "chat" | "responses";
 }
 
 /** Session params persisted between heartbeats. */

@@ -1,4 +1,5 @@
 import { OPENAI_V1_PATH } from "../shared/constants.js";
+import { getApiSurface, KNOWN_API_SURFACE } from "../shared/capability.js";
 
 /**
  * Paperclip's adapter-utils contract:
@@ -152,31 +153,56 @@ export async function testEnvironment(
     }
   }
 
-  // Real deployment validation — fire a 1-token chat completion against the
-  // actual deployment. This is the only way to know if the deployment exists
-  // and accepts requests. Skipped when prerequisites are missing or already
-  // failed above.
+  // Real deployment validation — fire a small ping against the actual API
+  // surface this deployment uses (chat completions or Responses API).
+  // Skipped when prerequisites are missing or already failed above.
   const hadFatal = checks.some((c) => c.level === "error");
+  const apiSurface = deployment
+    ? getApiSurface(deployment, asString(config.apiSurface))
+    : "chat";
+
+  // Surface a hint when we can't find the deployment in the known table —
+  // user might have typed a new one and forgot to set apiSurface.
+  if (deployment && !KNOWN_API_SURFACE[deployment] && !asString(config.apiSurface)) {
+    checks.push({
+      code: "deployment_unknown_to_table",
+      level: "info",
+      message: `Deployment "${deployment}" isn't in the known capability table; defaulting to "chat" path.`,
+      hint: "If this deployment only supports the Responses API, set adapterConfig.apiSurface to \"responses\".",
+    });
+  }
+
   if (deployment && endpoint && apiKey && !hadFatal) {
-    const chatUrl = `${endpoint}${OPENAI_V1_PATH}/chat/completions`;
+    const pingUrl =
+      apiSurface === "responses"
+        ? `${endpoint}${OPENAI_V1_PATH}/responses`
+        : `${endpoint}${OPENAI_V1_PATH}/chat/completions`;
+    const pingBody =
+      apiSurface === "responses"
+        ? {
+            model: deployment,
+            input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "ping" }] }],
+            max_output_tokens: 64,
+            store: false,
+            stream: false,
+          }
+        : {
+            model: deployment,
+            messages: [{ role: "user", content: "ping" }],
+            max_completion_tokens: 64,
+            stream: false,
+          };
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 10_000);
-      const res = await fetch(chatUrl, {
+      const timer = setTimeout(() => ctrl.abort(), 15_000);
+      const res = await fetch(pingUrl, {
         method: "POST",
         headers: {
           "api-key": apiKey,
           "content-type": "application/json",
           accept: "application/json",
         },
-        body: JSON.stringify({
-          model: deployment,
-          messages: [{ role: "user", content: "ping" }],
-          // Need enough room for reasoning models (gpt-5.x) to actually
-          // produce a token. Too low triggers a 400 "max_tokens reached".
-          max_completion_tokens: 64,
-          stream: false,
-        }),
+        body: JSON.stringify(pingBody),
         signal: ctrl.signal,
       });
       clearTimeout(timer);
@@ -185,7 +211,7 @@ export async function testEnvironment(
         checks.push({
           code: "deployment_ok",
           level: "info",
-          message: `Deployment "${deployment}" responds to chat completions.`,
+          message: `Deployment "${deployment}" responds (${apiSurface} path).`,
         });
       } else {
         const txt = await res.text().catch(() => "");
@@ -194,9 +220,19 @@ export async function testEnvironment(
         // That's a passing signal for our purposes.
         const isMaxTokensHint =
           res.status === 400 &&
-          (txt.includes("max_tokens") || txt.includes("model output limit"));
+          (txt.includes("max_tokens") ||
+            txt.includes("max_output_tokens") ||
+            txt.includes("model output limit"));
+        // Common "wrong API surface" signature: chat completions returning
+        // "operation is unsupported" for a responses-only model. Surface it
+        // distinctly so users know to flip apiSurface or pick a different
+        // deployment.
+        const isWrongSurface =
+          res.status === 400 &&
+          txt.includes("operation is unsupported");
         const isUnknownModel =
           !isMaxTokensHint &&
+          !isWrongSurface &&
           (txt.includes("DeploymentNotFound") ||
             txt.includes("does not exist") ||
             txt.includes("model_not_found") ||
@@ -205,7 +241,16 @@ export async function testEnvironment(
           checks.push({
             code: "deployment_ok",
             level: "info",
-            message: `Deployment "${deployment}" responds to chat completions (reasoning model — token cap hit on ping, but reachable).`,
+            message: `Deployment "${deployment}" responds (${apiSurface} path — reasoning model token cap hit on ping, but reachable).`,
+          });
+        } else if (isWrongSurface) {
+          const otherSurface = apiSurface === "chat" ? "responses" : "chat";
+          checks.push({
+            code: "deployment_wrong_surface",
+            level: "error",
+            message: `Deployment "${deployment}" rejected the ${apiSurface} API.`,
+            detail: txt.slice(0, 200) || null,
+            hint: `This deployment likely belongs on the ${otherSurface} path. Either pick a deployment that supports ${apiSurface}, or set adapterConfig.apiSurface to "${otherSurface}".`,
           });
         } else if (isUnknownModel) {
           checks.push({
@@ -223,9 +268,9 @@ export async function testEnvironment(
           });
         } else {
           checks.push({
-            code: "deployment_chat_failed",
+            code: "deployment_ping_failed",
             level: "warn",
-            message: `Deployment "${deployment}" returned HTTP ${res.status} on a ping.`,
+            message: `Deployment "${deployment}" returned HTTP ${res.status} on a ${apiSurface} ping.`,
             detail: txt.slice(0, 200) || null,
           });
         }

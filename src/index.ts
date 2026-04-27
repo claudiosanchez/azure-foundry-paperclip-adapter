@@ -1,9 +1,20 @@
 /**
  * Azure AI Foundry adapter for Paperclip.
  *
- * Runs Azure AI Foundry deployments (Azure-hosted OpenAI/codex/embeddings/audio/image
- * models) as managed employees in a Paperclip company, talking directly to the
- * Foundry endpoint over HTTPS — no CLI subprocess.
+ * Runs any Azure AI Foundry chat or reasoning deployment as a managed
+ * employee in a Paperclip company, talking directly to the Foundry endpoint
+ * over HTTPS — no CLI subprocess.
+ *
+ * Two API surfaces handled transparently:
+ *   • /openai/v1/chat/completions  — gpt-5-5, gpt-5-4-mini, gpt-5-4-nano
+ *   • /openai/v1/responses          — gpt-5-4-pro, gpt-5-3-codex, gpt-5-pro
+ *
+ * The dispatcher in src/server/execute.ts routes per deployment based on a
+ * hardcoded capability table (shared/capability.ts). Set `apiSurface` in
+ * adapterConfig to override for deployments not yet in the table.
+ *
+ * Embeddings/audio/image/realtime models live in a separate plugin
+ * (paperclip-plugin-foundry-tools, planned).
  *
  * @packageDocumentation
  */
@@ -16,26 +27,17 @@ export const label = ADAPTER_LABEL;
 export { createServerAdapter } from "./server/index.js";
 
 /**
- * Suggested deployments — chat-completion-capable Foundry models only.
- *
- * IMPORTANT: Some Foundry deployments are served exclusively through Azure's
- * Responses API (`/openai/v1/responses`) and do NOT support chat completions:
- *
- *   gpt-5-4-pro    (capabilities.chat_completion: false — pro reasoning)
- *   gpt-5-3-codex  (capabilities.chat_completion: false — codex/responses-only)
- *   gpt-5-pro      (capabilities.chat_completion: false)
- *
- * Selecting one of those would silently break agents (HTTP 400 "operation is
- * unsupported"). Until this adapter grows a Responses-API branch, only
- * chat-completable deployments are surfaced here.
- *
- * Embeddings/audio/image/realtime models live in a separate plugin
- * (paperclip-plugin-foundry-tools, planned).
+ * Suggested deployments — chat AND responses paths combined. Both wire
+ * formats are handled by the dispatcher; users pick a model and the adapter
+ * picks the endpoint.
  */
 export const models = [
   { id: "gpt-5-5", label: "gpt-5-5 (chat — flagship)" },
   { id: "gpt-5-4-mini", label: "gpt-5-4-mini (chat — high-volume)" },
   { id: "gpt-5-4-nano", label: "gpt-5-4-nano (chat — triage)" },
+  { id: "gpt-5-4-pro", label: "gpt-5-4-pro (responses — pro reasoning)" },
+  { id: "gpt-5-3-codex", label: "gpt-5-3-codex (responses — coding)" },
+  { id: "gpt-5-pro", label: "gpt-5-pro (responses — flagship pro)" },
 ];
 
 /**
