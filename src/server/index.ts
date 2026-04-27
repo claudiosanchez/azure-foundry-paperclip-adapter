@@ -17,6 +17,111 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 /**
+ * Declarative config schema — the Paperclip UI fetches this from
+ * GET /api/adapters/azure_foundry/config-schema and renders the right
+ * form fields automatically (labels, hints, types, dropdowns).
+ */
+function getConfigSchema() {
+  return {
+    fields: [
+      {
+        key: "endpoint",
+        label: "Endpoint",
+        type: "text" as const,
+        required: true,
+        hint: "Foundry resource base URL, e.g. https://foundry-coxshire-eastus2.cognitiveservices.azure.com/",
+        group: "Connection",
+      },
+      {
+        key: "apiKey",
+        label: "API key",
+        type: "text" as const,
+        required: true,
+        hint: "Resource API key. Stored encrypted as a Paperclip secret.",
+        group: "Connection",
+      },
+      {
+        key: "deployment",
+        label: "Deployment",
+        type: "combobox" as const,
+        required: true,
+        default: "gpt-5-5",
+        options: models.map((m) => ({ value: m.id, label: m.label })),
+        hint: "Azure-side deployment name. Must match exactly.",
+        group: "Connection",
+      },
+      {
+        key: "apiVersion",
+        label: "API version",
+        type: "text" as const,
+        hint: "Optional. Defaults to the modern /openai/v1 surface (no api-version param).",
+        group: "Connection",
+      },
+      {
+        key: "reasoningEffort",
+        label: "Reasoning effort",
+        type: "select" as const,
+        options: [
+          { value: "", label: "(model default)" },
+          { value: "minimal", label: "minimal" },
+          { value: "low", label: "low" },
+          { value: "medium", label: "medium" },
+          { value: "high", label: "high" },
+          { value: "xhigh", label: "xhigh" },
+        ],
+        hint: "Passed via reasoning_effort to deployments that support it.",
+        group: "Generation",
+      },
+      {
+        key: "temperature",
+        label: "Temperature",
+        type: "number" as const,
+        hint: "Sampling temperature. Leave blank for model default.",
+        group: "Generation",
+      },
+      {
+        key: "maxOutputTokens",
+        label: "Max output tokens",
+        type: "number" as const,
+        hint: "Hard cap on output tokens.",
+        group: "Generation",
+      },
+      {
+        key: "enableToolLoop",
+        label: "Enable tool loop",
+        type: "toggle" as const,
+        default: true,
+        hint: "When on, the agent executes sandbox tools (read_file, run_shell, etc.) and loops until the model returns a tool-free response.",
+        group: "Behavior",
+      },
+      {
+        key: "maxToolHops",
+        label: "Max tool hops",
+        type: "number" as const,
+        default: 20,
+        hint: "Maximum tool-call rounds before the loop bails out.",
+        group: "Behavior",
+      },
+      {
+        key: "timeoutSec",
+        label: "Timeout (seconds)",
+        type: "number" as const,
+        default: 300,
+        hint: "Run timeout in seconds.",
+        group: "Behavior",
+      },
+      {
+        key: "instructionsFilePath",
+        label: "Instructions file",
+        type: "text" as const,
+        hint: "Absolute path to a markdown file injected as the system prompt.",
+        group: "Instructions",
+      },
+    ],
+  };
+}
+
+/**
  * Plugin-loader entry point.
  *
  * Paperclip's external-adapter plugin loader calls `createServerAdapter()`
@@ -35,7 +140,10 @@ export function createServerAdapter() {
     syncSkills,
     models,
     supportsLocalAgentJwt: false,
+    supportsInstructionsBundle: true,
+    instructionsPathKey: "instructionsFilePath",
     agentConfigurationDoc,
+    getConfigSchema,
     detectModel: async () => {
       const d = detectModel();
       return { model: d.model, provider: "azure_foundry", source: d.source };
