@@ -1,13 +1,13 @@
 {
-  "name": "@xcreos/azure-foundry-paperclip-adapter",
+  "name": "@xcreos/azure-foundry-adapter",
   "version": "0.0.1",
-  "description": "Paperclip adapter for Azure AI Foundry — run Foundry deployments as managed employees in a Paperclip company",
+  "description": "Paperclip adapter for Azure AI Foundry \u2014 run Foundry deployments as managed employees in a Paperclip company",
   "type": "module",
   "license": "MIT",
   "author": "XCreos",
   "repository": {
     "type": "git",
-    "url": "https://github.com/xcreos/azure-foundry-paperclip-adapter"
+    "url": "https://github.com/claudiosanchez/azure-foundry-adapter"
   },
   "keywords": [
     "paperclip",

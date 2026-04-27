@@ -1,4 +1,4 @@
-# @xcreos/azure-foundry-paperclip-adapter
+# @xcreos/azure-foundry-adapter
 
 Paperclip adapter for **Azure AI Foundry** — run Foundry deployments
 (Azure-hosted OpenAI/codex/embeddings/audio/image models) as managed
@@ -17,7 +17,7 @@ deployment. Tool calls are surfaced as events but **not executed yet**
 ## Install
 
 ```bash
-pnpm add @xcreos/azure-foundry-paperclip-adapter
+pnpm add @xcreos/azure-foundry-adapter
 ```
 
 Then add it to your Paperclip server's adapter list (same way
@@ -80,7 +80,7 @@ pnpm build
 pnpm build
 pnpm link --global
 cd /path/to/Paperclip/server
-pnpm link --global @xcreos/azure-foundry-paperclip-adapter
+pnpm link --global @xcreos/azure-foundry-adapter
 ```
 
 Then register the adapter in the server's adapter registry (see
